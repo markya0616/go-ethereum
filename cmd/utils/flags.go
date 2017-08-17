@@ -213,6 +213,16 @@ var (
 		Name:  "txpool.nolocals",
 		Usage: "Disables price exemptions for locally submitted transactions",
 	}
+	TxPoolJournalFlag = cli.StringFlag{
+		Name:  "txpool.journal",
+		Usage: "Disk journal for local transaction to survive node restarts",
+		Value: core.DefaultTxPoolConfig.Journal,
+	}
+	TxPoolRejournalFlag = cli.DurationFlag{
+		Name:  "txpool.rejournal",
+		Usage: "Time interval to regenerate the local transaction journal",
+		Value: core.DefaultTxPoolConfig.Rejournal,
+	}
 	TxPoolPriceLimitFlag = cli.Uint64Flag{
 		Name:  "txpool.pricelimit",
 		Usage: "Minimum gas price limit to enforce for acceptance into the pool",
@@ -475,6 +485,32 @@ var (
 		Name:  "shh.pow",
 		Usage: "Minimum POW accepted",
 		Value: whisper.DefaultMinimumPoW,
+	}
+
+	// Raft flags
+	RaftModeFlag = cli.BoolFlag{
+		Name:  "raft",
+		Usage: "If enabled, uses Raft instead of Quorum Chain for consensus",
+	}
+	RaftBlockTimeFlag = cli.IntFlag{
+		Name:  "raftblocktime",
+		Usage: "Amount of time between raft block creations in milliseconds",
+		Value: 50,
+	}
+	RaftJoinExistingFlag = cli.IntFlag{
+		Name:  "raftjoinexisting",
+		Usage: "The raft ID to assume when joining an pre-existing cluster",
+		Value: 0,
+	}
+	EmitCheckpointsFlag = cli.BoolFlag{
+		Name:  "emitcheckpoints",
+		Usage: "If enabled, emit specially formatted logging checkpoints",
+	}
+
+	// Quorum
+	EnableNodePermissionFlag = cli.BoolFlag{
+		Name:  "permissioned",
+		Usage: "If enabled, the node will allow only a defined list of nodes to connect",
 	}
 )
 
@@ -803,6 +839,8 @@ func SetNodeConfig(ctx *cli.Context, cfg *node.Config) {
 	setWS(ctx, cfg)
 	setNodeUserIdent(ctx, cfg)
 
+	cfg.EnableNodePermission = ctx.GlobalBool(EnableNodePermissionFlag.Name)
+
 	switch {
 	case ctx.GlobalIsSet(DataDirFlag.Name):
 		cfg.DataDir = ctx.GlobalString(DataDirFlag.Name)
@@ -837,6 +875,12 @@ func setGPO(ctx *cli.Context, cfg *gasprice.Config) {
 func setTxPool(ctx *cli.Context, cfg *core.TxPoolConfig) {
 	if ctx.GlobalIsSet(TxPoolNoLocalsFlag.Name) {
 		cfg.NoLocals = ctx.GlobalBool(TxPoolNoLocalsFlag.Name)
+	}
+	if ctx.GlobalIsSet(TxPoolJournalFlag.Name) {
+		cfg.Journal = ctx.GlobalString(TxPoolJournalFlag.Name)
+	}
+	if ctx.GlobalIsSet(TxPoolRejournalFlag.Name) {
+		cfg.Rejournal = ctx.GlobalDuration(TxPoolRejournalFlag.Name)
 	}
 	if ctx.GlobalIsSet(TxPoolPriceLimitFlag.Name) {
 		cfg.PriceLimit = ctx.GlobalUint64(TxPoolPriceLimitFlag.Name)
@@ -987,7 +1031,8 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *eth.Config) {
 }
 
 // RegisterEthService adds an Ethereum client to the stack.
-func RegisterEthService(stack *node.Node, cfg *eth.Config) {
+func RegisterEthService(stack *node.Node, cfg *eth.Config) <-chan *eth.Ethereum {
+	nodeChan := make(chan *eth.Ethereum, 1)
 	var err error
 	if cfg.SyncMode == downloader.LightSync {
 		err = stack.Register(func(ctx *node.ServiceContext) (node.Service, error) {
@@ -1000,12 +1045,15 @@ func RegisterEthService(stack *node.Node, cfg *eth.Config) {
 				ls, _ := les.NewLesServer(fullNode, cfg)
 				fullNode.AddLesServer(ls)
 			}
+			nodeChan <- fullNode
 			return fullNode, err
 		})
 	}
 	if err != nil {
 		Fatalf("Failed to register the Ethereum service: %v", err)
 	}
+
+	return nodeChan
 }
 
 // RegisterShhService configures Whisper and adds it to the given node.
@@ -1077,7 +1125,10 @@ func MakeChain(ctx *cli.Context, stack *node.Node) (chain *core.BlockChain, chai
 
 	engine := ethash.NewFaker()
 	if !ctx.GlobalBool(FakePoWFlag.Name) {
-		engine = ethash.New("", 1, 0, "", 1, 0)
+		engine = ethash.New(
+			stack.ResolvePath(eth.DefaultConfig.EthashCacheDir), eth.DefaultConfig.EthashCachesInMem, eth.DefaultConfig.EthashCachesOnDisk,
+			stack.ResolvePath(eth.DefaultConfig.EthashDatasetDir), eth.DefaultConfig.EthashDatasetsInMem, eth.DefaultConfig.EthashDatasetsOnDisk,
+		)
 	}
 	config, _, err := core.SetupGenesisBlock(chainDb, MakeGenesis(ctx))
 	if err != nil {

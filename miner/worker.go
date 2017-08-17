@@ -24,7 +24,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc"
@@ -73,6 +72,9 @@ type Work struct {
 	receipts []*types.Receipt
 
 	createdAt time.Time
+
+	// Leave this publicState named state, add privateState which most code paths can just ignore
+	privateState *state.StateDB
 }
 
 type Result struct {
@@ -109,9 +111,6 @@ type worker struct {
 	uncleMu        sync.Mutex
 	possibleUncles map[common.Hash]*types.Block
 
-	txQueueMu sync.Mutex
-	txQueue   map[common.Hash]*types.Transaction
-
 	unconfirmed *unconfirmedBlocks // set of locally mined blocks pending canonicalness confirmations
 
 	// atomic status counters
@@ -133,16 +132,18 @@ func newWorker(config *params.ChainConfig, engine consensus.Engine, coinbase com
 		proc:           eth.BlockChain().Validator(),
 		possibleUncles: make(map[common.Hash]*types.Block),
 		coinbase:       coinbase,
-		txQueue:        make(map[common.Hash]*types.Transaction),
 		agents:         make(map[Agent]struct{}),
-		unconfirmed:    newUnconfirmedBlocks(eth.BlockChain(), 5),
+		unconfirmed:    newUnconfirmedBlocks(eth.BlockChain(), miningLogAtDepth),
 		fullValidation: false,
 	}
-	worker.events = worker.mux.Subscribe(core.ChainHeadEvent{}, core.ChainSideEvent{}, core.TxPreEvent{})
-	go worker.update()
 
-	go worker.wait()
-	worker.commitNewWork()
+	if !config.IsQuorum {
+		worker.events = worker.mux.Subscribe(core.ChainHeadEvent{}, core.ChainSideEvent{}, core.TxPreEvent{})
+		go worker.update()
+
+		go worker.wait()
+		worker.commitNewWork()
+	}
 
 	return worker
 }
@@ -159,7 +160,7 @@ func (self *worker) setExtra(extra []byte) {
 	self.extra = extra
 }
 
-func (self *worker) pending() (*types.Block, *state.StateDB) {
+func (self *worker) pending() (*types.Block, *state.StateDB, *state.StateDB) {
 	self.currentMu.Lock()
 	defer self.currentMu.Unlock()
 
@@ -169,9 +170,9 @@ func (self *worker) pending() (*types.Block, *state.StateDB) {
 			self.current.txs,
 			nil,
 			self.current.receipts,
-		), self.current.state.Copy()
+		), self.current.state.Copy(), self.current.privateState.Copy()
 	}
-	return self.current.Block, self.current.state.Copy()
+	return self.current.Block, self.current.state.Copy(), self.current.privateState.Copy()
 }
 
 func (self *worker) pendingBlock() *types.Block {
@@ -339,19 +340,21 @@ func (self *worker) push(work *Work) {
 
 // makeCurrent creates a new environment for the current cycle.
 func (self *worker) makeCurrent(parent *types.Block, header *types.Header) error {
-	state, err := self.chain.StateAt(parent.Root())
+	publicState, privateState, err := self.chain.StateAt(parent.Root())
 	if err != nil {
 		return err
 	}
 	work := &Work{
 		config:    self.config,
 		signer:    types.NewEIP155Signer(self.config.ChainId),
-		state:     state,
+		state:     publicState,
 		ancestors: set.New(),
 		family:    set.New(),
 		uncles:    set.New(),
 		header:    header,
 		createdAt: time.Now(),
+
+		privateState: privateState,
 	}
 
 	// when 08 is processed ancestors contain 07 (quick block)
@@ -362,11 +365,7 @@ func (self *worker) makeCurrent(parent *types.Block, header *types.Header) error
 		work.family.Add(ancestor.Hash())
 		work.ancestors.Add(ancestor.Hash())
 	}
-	wallets := self.eth.AccountManager().Wallets()
-	accounts := make([]accounts.Account, 0, len(wallets))
-	for _, wallet := range wallets {
-		accounts = append(accounts, wallet.Accounts()...)
-	}
+
 	// Keep track of transactions which return errors so they can be removed
 	work.tcount = 0
 	self.current = work
@@ -567,7 +566,7 @@ func (env *Work) commitTransactions(mux *event.TypeMux, txs *types.TransactionsB
 func (env *Work) commitTransaction(tx *types.Transaction, bc *core.BlockChain, coinbase common.Address, gp *core.GasPool) (error, []*types.Log) {
 	snap := env.state.Snapshot()
 
-	receipt, _, err := core.ApplyTransaction(env.config, bc, &coinbase, gp, env.state, env.header, tx, env.header.GasUsed, vm.Config{})
+	receipt, _, _, err := core.ApplyTransaction(env.config, bc, &coinbase, gp, env.state, env.privateState, env.header, tx, env.header.GasUsed, vm.Config{})
 	if err != nil {
 		env.state.RevertToSnapshot(snap)
 		return err, nil

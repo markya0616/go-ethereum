@@ -30,6 +30,7 @@ var Modules = map[string]string{
 	"shh":        Shh_JS,
 	"swarmfs":    SWARMFS_JS,
 	"txpool":     TxPool_JS,
+	"raft":       Raft_JS,
 }
 
 const Chequebook_JS = `
@@ -493,6 +494,11 @@ web3._extend({
 			params: 2
 		}),
 		new web3._extend.Method({
+			name: 'openWallet',
+			call: 'personal_openWallet',
+			params: 2
+		}),
+		new web3._extend.Method({
 			name: 'deriveAccount',
 			call: 'personal_deriveAccount',
 			params: 3
@@ -694,4 +700,20 @@ web3._extend({
 		})
 	]
 });
+`
+
+const Raft_JS = `
+web3._extend({
+       property: 'raft',
+       methods:
+       [
+       ],
+       properties:
+       [
+               new web3._extend.Property({
+                       name: 'role',
+                       getter: 'raft_role'
+               })
+       ]
+})
 `

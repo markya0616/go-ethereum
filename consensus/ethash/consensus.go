@@ -30,6 +30,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/misc"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	set "gopkg.in/fatih/set.v0"
 )
@@ -38,6 +39,8 @@ import (
 var (
 	blockReward *big.Int = big.NewInt(5e+18) // Block reward in wei for successfully mining a block
 	maxUncles            = 2                 // Maximum number of uncles allowed in a single block
+
+	nanosecond2017Timestamp = forceParseRfc3339("2017-01-01T00:00:00+00:00").UnixNano()
 )
 
 // Various error messages to mark blocks invalid. These should be private to
@@ -56,6 +59,14 @@ var (
 	errInvalidMixDigest  = errors.New("invalid mix digest")
 	errInvalidPoW        = errors.New("invalid proof-of-work")
 )
+
+func forceParseRfc3339(str string) time.Time {
+	time, err := time.Parse(time.RFC3339, str)
+	if err != nil {
+		panic("unexpected failure to parse rfc3339 timestamp: " + str)
+	}
+	return time
+}
 
 // Author implements consensus.Engine, returning the header's coinbase as the
 // proof-of-work verified author of the block.
@@ -221,17 +232,34 @@ func (ethash *Ethash) VerifyUncles(chain consensus.ChainReader, block *types.Blo
 // See YP section 4.3.4. "Block Header Validity"
 func (ethash *Ethash) verifyHeader(chain consensus.ChainReader, header, parent *types.Header, uncle bool, seal bool) error {
 	// Ensure that the header's extra-data section is of a reasonable size
-	if uint64(len(header.Extra)) > params.MaximumExtraDataSize {
-		return fmt.Errorf("extra-data too long: %d > %d", len(header.Extra), params.MaximumExtraDataSize)
+	maximumExtraDataSize := params.GetMaximumExtraDataSize(chain.Config().IsQuorum)
+	if uint64(len(header.Extra)) > maximumExtraDataSize {
+		return fmt.Errorf("extra-data too long: %d > %d", len(header.Extra), maximumExtraDataSize)
 	}
 	// Verify the header's timestamp
 	if uncle {
 		if header.Time.Cmp(math.MaxBig256) > 0 {
 			return errLargeBlockTime
 		}
-	} else {
+	} else if !chain.Config().IsQuorum {
 		if header.Time.Cmp(big.NewInt(time.Now().Unix())) > 0 {
 			return consensus.ErrFutureBlock
+		}
+	} else {
+		// We disable future checking if we're in --raft mode. This is crucial
+		// because block validation in the raft setting needs to be deterministic.
+		// There is no forking of the chain, and we need each node to only perform
+		// validation as a pure function of block contents with respect to the
+		// previous database state.
+		//
+		// NOTE: whereas we are currently checking whether the timestamp field has
+		// nanosecond semantics to detect --raft mode, we could also use a special
+		// "raft" sentinel in the Extra field, or pass a boolean for raftMode from
+		// all call sites of this function.
+		if raftMode := time.Now().UnixNano() > nanosecond2017Timestamp; !raftMode {
+			if header.Time.Cmp(big.NewInt(time.Now().Unix())) > 0 {
+				return consensus.ErrFutureBlock
+			}
 		}
 	}
 	if header.Time.Cmp(parent.Time) <= 0 {
@@ -287,8 +315,10 @@ func (ethash *Ethash) verifyHeader(chain consensus.ChainReader, header, parent *
 // given the parent block's time and difficulty.
 // TODO (karalabe): Move the chain maker into this package and make this private!
 func CalcDifficulty(config *params.ChainConfig, time uint64, parent *types.Header) *big.Int {
-	next := new(big.Int).Add(parent.Number, common.Big1)
+	next := new(big.Int).Add(parent.Number, big1)
 	switch {
+	case config.IsMetropolis(next):
+		return calcDifficultyMetropolis(time, parent)
 	case config.IsHomestead(next):
 		return calcDifficultyHomestead(time, parent)
 	default:
@@ -299,9 +329,64 @@ func CalcDifficulty(config *params.ChainConfig, time uint64, parent *types.Heade
 // Some weird constants to avoid constant memory allocs for them.
 var (
 	expDiffPeriod = big.NewInt(100000)
+	big1          = big.NewInt(1)
+	big2          = big.NewInt(2)
+	big9          = big.NewInt(9)
 	big10         = big.NewInt(10)
 	bigMinus99    = big.NewInt(-99)
 )
+
+// calcDifficultyMetropolis is the difficulty adjustment algorithm. It returns
+// the difficulty that a new block should have when created at time given the
+// parent block's time and difficulty. The calculation uses the Metropolis rules.
+func calcDifficultyMetropolis(time uint64, parent *types.Header) *big.Int {
+	// https://github.com/ethereum/EIPs/issues/100.
+	// algorithm:
+	// diff = (parent_diff +
+	//         (parent_diff / 2048 * max((2 if len(parent.uncles) else 1) - ((timestamp - parent.timestamp) // 9), -99))
+	//        ) + 2^(periodCount - 2)
+
+	bigTime := new(big.Int).SetUint64(time)
+	bigParentTime := new(big.Int).Set(parent.Time)
+
+	// holds intermediate values to make the algo easier to read & audit
+	x := new(big.Int)
+	y := new(big.Int)
+
+	// (2 if len(parent_uncles) else 1) - (block_timestamp - parent_timestamp) // 9
+	x.Sub(bigTime, bigParentTime)
+	x.Div(x, big9)
+	if parent.UncleHash == types.EmptyUncleHash {
+		x.Sub(big1, x)
+	} else {
+		x.Sub(big2, x)
+	}
+	// max((2 if len(parent_uncles) else 1) - (block_timestamp - parent_timestamp) // 9, -99)
+	if x.Cmp(bigMinus99) < 0 {
+		x.Set(bigMinus99)
+	}
+	// (parent_diff + parent_diff // 2048 * max(1 - (block_timestamp - parent_timestamp) // 10, -99))
+	y.Div(parent.Difficulty, params.DifficultyBoundDivisor)
+	x.Mul(y, x)
+	x.Add(parent.Difficulty, x)
+
+	// minimum difficulty can ever be (before exponential factor)
+	if x.Cmp(params.MinimumDifficulty) < 0 {
+		x.Set(params.MinimumDifficulty)
+	}
+	// for the exponential factor
+	periodCount := new(big.Int).Add(parent.Number, big1)
+	periodCount.Div(periodCount, expDiffPeriod)
+
+	// the exponential factor, commonly referred to as "the bomb"
+	// diff = diff + 2^(periodCount - 2)
+	if periodCount.Cmp(big1) > 0 {
+		y.Sub(periodCount, big2)
+		y.Exp(big2, y, nil)
+		x.Add(x, y)
+	}
+	return x
+}
 
 // calcDifficultyHomestead is the difficulty adjustment algorithm. It returns
 // the difficulty that a new block should have when created at time given the
@@ -320,12 +405,12 @@ func calcDifficultyHomestead(time uint64, parent *types.Header) *big.Int {
 	x := new(big.Int)
 	y := new(big.Int)
 
-	// 1 - (block_timestamp -parent_timestamp) // 10
+	// 1 - (block_timestamp - parent_timestamp) // 10
 	x.Sub(bigTime, bigParentTime)
 	x.Div(x, big10)
-	x.Sub(common.Big1, x)
+	x.Sub(big1, x)
 
-	// max(1 - (block_timestamp - parent_timestamp) // 10, -99)))
+	// max(1 - (block_timestamp - parent_timestamp) // 10, -99)
 	if x.Cmp(bigMinus99) < 0 {
 		x.Set(bigMinus99)
 	}
@@ -339,14 +424,14 @@ func calcDifficultyHomestead(time uint64, parent *types.Header) *big.Int {
 		x.Set(params.MinimumDifficulty)
 	}
 	// for the exponential factor
-	periodCount := new(big.Int).Add(parent.Number, common.Big1)
+	periodCount := new(big.Int).Add(parent.Number, big1)
 	periodCount.Div(periodCount, expDiffPeriod)
 
 	// the exponential factor, commonly referred to as "the bomb"
 	// diff = diff + 2^(periodCount - 2)
-	if periodCount.Cmp(common.Big1) > 0 {
-		y.Sub(periodCount, common.Big2)
-		y.Exp(common.Big2, y, nil)
+	if periodCount.Cmp(big1) > 0 {
+		y.Sub(periodCount, big2)
+		y.Exp(big2, y, nil)
 		x.Add(x, y)
 	}
 	return x
@@ -373,12 +458,12 @@ func calcDifficultyFrontier(time uint64, parent *types.Header) *big.Int {
 		diff.Set(params.MinimumDifficulty)
 	}
 
-	periodCount := new(big.Int).Add(parent.Number, common.Big1)
+	periodCount := new(big.Int).Add(parent.Number, big1)
 	periodCount.Div(periodCount, expDiffPeriod)
-	if periodCount.Cmp(common.Big1) > 0 {
+	if periodCount.Cmp(big1) > 0 {
 		// diff = diff + 2^(periodCount - 2)
-		expDiff := periodCount.Sub(periodCount, common.Big2)
-		expDiff.Exp(common.Big2, expDiff, nil)
+		expDiff := periodCount.Sub(periodCount, big2)
+		expDiff.Exp(big2, expDiff, nil)
 		diff.Add(diff, expDiff)
 		diff = math.BigMax(diff, params.MinimumDifficulty)
 	}
@@ -388,6 +473,8 @@ func calcDifficultyFrontier(time uint64, parent *types.Header) *big.Int {
 // VerifySeal implements consensus.Engine, checking whether the given block satisfies
 // the PoW difficulty requirements.
 func (ethash *Ethash) VerifySeal(chain consensus.ChainReader, header *types.Header) error {
+	isQuorum := chain != nil && chain.Config().IsQuorum
+
 	// If we're running a fake PoW, accept any seal as valid
 	if ethash.fakeMode {
 		time.Sleep(ethash.fakeDelay)
@@ -419,11 +506,18 @@ func (ethash *Ethash) VerifySeal(chain consensus.ChainReader, header *types.Head
 	}
 	digest, result := hashimotoLight(size, cache, header.HashNoNonce().Bytes(), header.Nonce.Uint64())
 	if !bytes.Equal(header.MixDigest[:], digest) {
-		return errInvalidMixDigest
+		if isQuorum {
+			log.Info("invalid mix digest", "calculated", fmt.Sprintf("%x", digest), "in header", fmt.Sprintf("%x", header.MixDigest[:]))
+		} else {
+			return errInvalidMixDigest
+		}
+
 	}
 	target := new(big.Int).Div(maxUint256, header.Difficulty)
 	if new(big.Int).SetBytes(result).Cmp(target) > 0 {
-		return errInvalidPoW
+		if !isQuorum {
+			return errInvalidPoW
+		}
 	}
 	return nil
 }

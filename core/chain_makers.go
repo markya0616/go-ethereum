@@ -85,7 +85,7 @@ func (b *BlockGen) AddTx(tx *types.Transaction) {
 		b.SetCoinbase(common.Address{})
 	}
 	b.statedb.Prepare(tx.Hash(), common.Hash{}, len(b.txs))
-	receipt, _, err := ApplyTransaction(b.config, nil, &b.header.Coinbase, b.gasPool, b.statedb, b.header, tx, b.header.GasUsed, vm.Config{})
+	receipt, _, _, err := ApplyTransaction(b.config, nil, &b.header.Coinbase, b.gasPool, b.statedb, b.statedb, b.header, tx, b.header.GasUsed, vm.Config{})
 	if err != nil {
 		panic(err)
 	}
@@ -218,6 +218,7 @@ func makeHeader(config *params.ChainConfig, parent *types.Block, state *state.St
 			Number:     parent.Number(),
 			Time:       new(big.Int).Sub(time, big.NewInt(10)),
 			Difficulty: parent.Difficulty(),
+			UncleHash:  parent.UncleHash(),
 		}),
 		GasLimit: CalcGasLimit(parent),
 		GasUsed:  new(big.Int),

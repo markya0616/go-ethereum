@@ -96,6 +96,8 @@ var AppHelpFlagGroups = []flagGroup{
 		Name: "TRANSACTION POOL",
 		Flags: []cli.Flag{
 			utils.TxPoolNoLocalsFlag,
+			utils.TxPoolJournalFlag,
+			utils.TxPoolRejournalFlag,
 			utils.TxPoolPriceLimitFlag,
 			utils.TxPoolPriceBumpFlag,
 			utils.TxPoolAccountSlotsFlag,
@@ -110,6 +112,14 @@ var AppHelpFlagGroups = []flagGroup{
 		Flags: []cli.Flag{
 			utils.CacheFlag,
 			utils.TrieCacheGenFlag,
+		},
+	},
+	{
+		Name: "RAFT",
+		Flags: []cli.Flag{
+			utils.RaftModeFlag,
+			utils.RaftBlockTimeFlag,
+			utils.RaftJoinExistingFlag,
 		},
 	},
 	{

@@ -81,7 +81,7 @@ type TxRelayBackend interface {
 func NewTxPool(config *params.ChainConfig, eventMux *event.TypeMux, chain *LightChain, relay TxRelayBackend) *TxPool {
 	pool := &TxPool{
 		config:   config,
-		signer:   types.HomesteadSigner{},
+		signer:   types.NewEIP155Signer(config.ChainId),
 		nonce:    make(map[common.Address]uint64),
 		pending:  make(map[common.Hash]*types.Transaction),
 		mined:    make(map[common.Hash][]*types.Transaction),
@@ -122,12 +122,6 @@ func (pool *TxPool) GetNonce(ctx context.Context, addr common.Address) (uint64, 
 		pool.nonce[addr] = nonce
 	}
 	return nonce, nil
-}
-
-type txBlockData struct {
-	BlockHash  common.Hash
-	BlockIndex uint64
-	Index      uint64
 }
 
 // txStateChanges stores the recent changes between pending/mined states of
